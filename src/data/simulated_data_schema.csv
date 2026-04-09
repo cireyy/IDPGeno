@@ -1,0 +1,26 @@
+file,column,description
+processed_samples_simulated.csv,participant_id,Sample identifier; matches token table
+processed_samples_simulated.csv,label,"Binary outcome (0=control, 1=case)"
+processed_samples_simulated.csv,MD_ALIC_R,"Mean diffusivity in anterior limb of internal capsule, right"
+processed_samples_simulated.csv,MD_ALIC_L,"Mean diffusivity in anterior limb of internal capsule, left"
+processed_samples_simulated.csv,FA_ALIC_R,"Fractional anisotropy in anterior limb of internal capsule, right"
+processed_samples_simulated.csv,ISOVF_ALIC_R,"ISOVF in anterior limb of internal capsule, right"
+processed_samples_simulated.csv,ISOVF_ALIC_L,"ISOVF in anterior limb of internal capsule, left"
+processed_samples_simulated.csv,MD_ATR_R,"Mean diffusivity in anterior thalamic radiation, right"
+processed_samples_simulated.csv,ISOVF_SCR_L,"ISOVF in superior corona radiata, left"
+processed_samples_simulated.csv,ISOVF_PCR_R,"ISOVF in posterior corona radiata, right"
+processed_samples_simulated.csv,MD_SCR_R,"Mean diffusivity in superior corona radiata, right"
+processed_samples_simulated.csv,MD_SCR_L,"Mean diffusivity in superior corona radiata, left"
+processed_samples_simulated.csv,MD_PCR_L,"Mean diffusivity in posterior corona radiata, left"
+processed_samples_simulated.csv,MD_EC_R,"Mean diffusivity in external capsule, right"
+processed_samples_simulated.csv,MD_SFOF_R,"Mean diffusivity in superior fronto-occipital fasciculus, right"
+processed_samples_simulated.csv,MD_SFOF_L,"Mean diffusivity in superior fronto-occipital fasciculus, left"
+processed_snp_tokens_simulated.csv,participant_id,Sample identifier; joins to sample table
+processed_snp_tokens_simulated.csv,gene_id,Gene identifier
+processed_snp_tokens_simulated.csv,token_index_within_gene,1-based token order within each gene
+processed_snp_tokens_simulated.csv,snp_id,SNP identifier
+processed_snp_tokens_simulated.csv,geno_code,"Genotype dosage code in {0,1,2}"
+processed_snp_tokens_simulated.csv,relative_pos,"Relative SNP position in [-1,1]"
+processed_snp_tokens_simulated.csv,maf,Minor allele frequency feature
+processed_snp_tokens_simulated.csv,within_gene_weight_a,Auxiliary functional/quality-like feature
+processed_snp_tokens_simulated.csv,is_valid,1 indicates valid token; padding rows would use 0
