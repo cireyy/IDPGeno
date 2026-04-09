@@ -68,4 +68,19 @@ You can install all required packages using:
 
 ```bash
 pip install -r requirements.txt
+```
 
+## Configuration
+
+All model, data, and training settings are specified in:
+
+```bash
+configs/configs.yaml
+```
+
+## Model Training
+
+Run the following command from the project root:
+```bash
+python -m src.training.train --config configs/configs.yaml
+```
