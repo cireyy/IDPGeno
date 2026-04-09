@@ -53,44 +53,19 @@ Because the original data cannot be publicly released, this repository includes 
 
 ---
 
-## Data Format
+## Dependencies
 
-### 1. `src/data/processed_samples_simulated.csv`
+To run the IDPGeno framework, the following dependencies are required:
 
-A sample-level table containing:
+- Python 3.8+
+- PyTorch >= 2.1
+- NumPy >= 1.24
+- pandas >= 2.0
+- scikit-learn >= 1.3
+- PyYAML >= 6.0
 
-- `participant_id`
-- binary `label`
-- 14 brain IDP features
+You can install all required packages using:
 
-Each row corresponds to one individual.
-
-### 2. `src/data/processed_snp_tokens_simulated.csv`
-
-A token-level table containing one row per:
-
-- participant
-- gene
-- SNP token position within gene
-
-Required columns include:
-
-- `participant_id`
-- `gene_id`
-- `token_index_within_gene`
-- `snp_id`
-- `geno_code`
-- `relative_pos`
-- `maf`
-- `within_gene_weight_a`
-- `is_valid`
-
-These fields are converted into the model inputs:
-
-- `geno_ids`
-- `pos_values`
-- `func_values`
-- `snp_mask`
-
----
+```bash
+pip install -r requirements.txt
 
