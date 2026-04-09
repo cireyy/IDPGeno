@@ -5,8 +5,8 @@ project:
   output_dir: outputs/idpgeno_moe
 
 data:
-  samples_csv: data/processed_samples_simulated.csv
-  snp_tokens_csv: data/processed_snp_tokens_simulated.csv
+  samples_csv: src/data/processed_samples_simulated.csv
+  snp_tokens_csv: src/data/processed_snp_tokens_simulated.csv
 
   participant_col: participant_id
   label_col: label
