@@ -1,15 +1,10 @@
-# models/idpgeno_model.py
-
 from typing import Dict
-
 import torch
 import torch.nn as nn
-
-from models.gene_encoder import GeneEncoder
-from models.idp_encoder import IDPEncoder
-from models.film import GeneWiseFiLM
-from models.backbone_moe_transformer import MoETransformerBackbone
-
+from src.models.gene_encoder import GeneEncoder
+from src.models.idp_encoder import IDPEncoder
+from src.models.film import GeneWiseFiLM
+from src.models.backbone_moe_transformer import MoETransformerBackbone
 
 class IDPGenoModel(nn.Module):
     """
