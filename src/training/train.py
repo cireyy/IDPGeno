@@ -8,10 +8,10 @@ import torch
 import yaml
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Subset
-from data.dataset import IDPGenoProcessedDataset
-from models.idpgeno_model import IDPGenoModel
-from training.metrics import format_metrics
-from training.trainer import run_one_epoch, build_loss_fn, save_checkpoint
+from src.data.dataset import IDPGenoProcessedDataset
+from src.models.idpgeno_model import IDPGenoModel
+from src.training.metrics import format_metrics
+from src.training.trainer import run_one_epoch, build_loss_fn, save_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
