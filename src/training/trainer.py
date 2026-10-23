@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -91,6 +91,8 @@ def save_checkpoint(
     path: str,
     epoch: int,
     metrics: Dict[str, float],
+    preprocessing: Optional[Dict] = None,
+    feature_info: Optional[Dict] = None,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
@@ -98,6 +100,8 @@ def save_checkpoint(
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "metrics": metrics,
+            "preprocessing": preprocessing,
+            "feature_info": feature_info,
         },
         path,
     )

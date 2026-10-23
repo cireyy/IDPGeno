@@ -7,8 +7,8 @@ import numpy as np
 import torch
 import yaml
 from sklearn.model_selection import StratifiedKFold
-from torch.utils.data import DataLoader, Subset
-from src.data.dataset import IDPGenoProcessedDataset
+from torch.utils.data import DataLoader
+from src.data.dataset import IDPGenoProcessedDataset, build_fold_datasets
 from src.models.idpgeno_model import IDPGenoModel
 from src.training.metrics import format_metrics
 from src.training.trainer import run_one_epoch, build_loss_fn, save_checkpoint
@@ -58,7 +58,8 @@ def build_dataset(config: Dict[str, Any]) -> IDPGenoProcessedDataset:
         pos_col=data_cfg.get("pos_col", "relative_pos"),
         func_cols=data_cfg.get("func_cols", ["maf", "within_gene_weight_a"]),
         mask_col=data_cfg.get("mask_col", "is_valid"),
-        normalize_idp=data_cfg.get("normalize_idp", True),
+        # Load raw values once; fitting is deferred until after each CV split.
+        normalize_idp=False,
     )
     return dataset
 
@@ -147,8 +148,10 @@ def main() -> None:
         print(f"Fold {fold_idx}/{num_folds}")
         print("=" * 100)
 
-        train_subset = Subset(dataset, train_idx.tolist())
-        val_subset = Subset(dataset, val_idx.tolist())
+        train_subset, val_subset = build_fold_datasets(
+            dataset, train_idx, val_idx,
+            normalize_idp=config["data"].get("normalize_idp", True),
+        )
 
         train_loader = DataLoader(
             train_subset,
@@ -211,6 +214,8 @@ def main() -> None:
             path=ckpt_path,
             epoch=best_epoch,
             metrics=best_metrics if best_metrics is not None else {},
+            preprocessing=train_subset.preprocessing_state(),
+            feature_info=feature_info,
         )
 
         print(f"\nBest fold {fold_idx} epoch: {best_epoch}")

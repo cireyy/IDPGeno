@@ -84,3 +84,15 @@ Run the following command from the project root:
 ```bash
 python -m src.training.train --config configs/configs.yaml
 ```
+
+## Fold-local IDP preprocessing
+
+IDP scaling is fitted separately on each training fold and reused for its
+validation fold. Checkpoints save the fitted parameters and ordered feature
+schema. Direct dataset construction with normalization enabled requires explicit
+training-fitted statistics; use `normalize_idp=False` to load raw values.
+
+Run regression tests with `python -m pytest -q tests/test_fold_preprocessing.py`
+after installing `pytest`. See [the preprocessing audit](docs/preprocessing_audit.md)
+for API migration, remaining upstream/evaluation risks, and the distinction between
+simulated-data validation and research results requiring real-data reruns.
