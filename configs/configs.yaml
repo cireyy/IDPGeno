@@ -19,7 +19,7 @@ data:
     - maf
     - within_gene_weight_a
 
-  normalize_idp: true
+  normalize_idp: true  # Fit on each training fold only; reuse for validation.
 
 model:
   name: IDPGenoModel

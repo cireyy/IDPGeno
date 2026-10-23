@@ -2,7 +2,77 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
+
+
+def validate_idp_stats(mean, std, num_features):
+    """Validate externally fitted statistics without silently refitting them."""
+    if mean is None or std is None:
+        raise ValueError("Both idp_mean and idp_std are required; fit on training rows only.")
+    mean = np.array(mean, dtype=np.float32, copy=True)
+    std = np.array(std, dtype=np.float32, copy=True)
+    if mean.shape != (num_features,) or std.shape != (num_features,):
+        raise ValueError("IDP statistics must match the IDP feature count and order.")
+    if not np.isfinite(mean).all() or not np.isfinite(std).all() or (std < 0).any():
+        raise ValueError("IDP statistics must be finite with non-negative standard deviations.")
+    return mean, np.where(std < 1e-8, 1.0, std)
+
+
+class IDPFoldSubset(Subset):
+    """Independent fold view; shares genomic tensors but never mutates raw IDPs."""
+
+    def __init__(self, dataset, indices, idp_mean=None, idp_std=None):
+        super().__init__(dataset, np.asarray(indices).tolist())
+        self.idp_mean = self.idp_std = None
+        if idp_mean is not None or idp_std is not None:
+            self.idp_mean, self.idp_std = validate_idp_stats(
+                idp_mean, idp_std, len(dataset.idp_cols)
+            )
+
+    def __getitem__(self, idx):
+        sample = self.dataset[self.indices[idx]]
+        if self.idp_mean is not None:
+            sample["idp"] = (sample["idp"] - torch.from_numpy(self.idp_mean)) / torch.from_numpy(self.idp_std)
+        return sample
+
+    def __getitems__(self, indices):
+        # Subset's batched fast path would otherwise bypass our transform.
+        return [self[idx] for idx in indices]
+
+    def preprocessing_state(self):
+        return {
+            "normalize_idp": self.idp_mean is not None,
+            "idp_cols": list(self.dataset.idp_cols),
+            "idp_mean": None if self.idp_mean is None else torch.from_numpy(self.idp_mean.copy()),
+            "idp_std": None if self.idp_std is None else torch.from_numpy(self.idp_std.copy()),
+            "std_ddof": 0,
+        }
+
+
+def build_fold_datasets(dataset, train_indices, val_indices, normalize_idp=True):
+    """Fit IDP scaling on training rows and apply it to both disjoint views."""
+    if dataset.normalize_idp:
+        raise ValueError("Cross-validation requires a raw, unnormalized dataset.")
+    train_indices = np.asarray(train_indices)
+    val_indices = np.asarray(val_indices)
+    for indices in (train_indices, val_indices):
+        if (indices.ndim != 1 or indices.size == 0
+                or not np.issubdtype(indices.dtype, np.integer)
+                or (indices < 0).any() or (indices >= len(dataset)).any()
+                or len(np.unique(indices)) != len(indices)):
+            raise ValueError("Fold indices must be nonempty, unique, valid integer row indices.")
+    if np.intersect1d(train_indices, val_indices).size:
+        raise ValueError("Training and validation folds must be disjoint.")
+    mean = std = None
+    if normalize_idp:
+        train_idps = dataset.idp_array[train_indices]
+        mean, std = validate_idp_stats(
+            train_idps.mean(axis=0, dtype=np.float64),
+            train_idps.std(axis=0, dtype=np.float64, ddof=0),
+            len(dataset.idp_cols),
+        )
+    return (IDPFoldSubset(dataset, train_indices, mean, std),
+            IDPFoldSubset(dataset, val_indices, mean, std))
 
 
 class IDPGenoProcessedDataset(Dataset):
@@ -52,24 +122,23 @@ class IDPGenoProcessedDataset(Dataset):
         # Build participant order from sample table
         self.participant_ids = self.samples_df[self.participant_col].astype(str).tolist()
         self.num_samples = len(self.participant_ids)
+        if self.samples_df[self.participant_col].isna().any() or len(set(self.participant_ids)) != self.num_samples:
+            raise ValueError("Sample participant IDs must be non-missing and unique before CV.")
 
         # Labels
         self.labels = self.samples_df[self.label_col].to_numpy(dtype=np.float32)
 
         # IDP matrix
         self.idp_array = self.samples_df[self.idp_cols].to_numpy(dtype=np.float32)
+        if not np.isfinite(self.idp_array).all():
+            raise ValueError("IDPs must be finite; fit any imputation on training rows only.")
 
         # Normalize IDPs
         self.normalize_idp = normalize_idp
         if self.normalize_idp:
-            if idp_mean is None or idp_std is None:
-                self.idp_mean = self.idp_array.mean(axis=0)
-                self.idp_std = self.idp_array.std(axis=0)
-            else:
-                self.idp_mean = idp_mean.astype(np.float32)
-                self.idp_std = idp_std.astype(np.float32)
-
-            self.idp_std = np.where(self.idp_std < 1e-8, 1.0, self.idp_std)
+            self.idp_mean, self.idp_std = validate_idp_stats(
+                idp_mean, idp_std, len(self.idp_cols)
+            )
             self.idp_array = (self.idp_array - self.idp_mean) / self.idp_std
         else:
             self.idp_mean = None
