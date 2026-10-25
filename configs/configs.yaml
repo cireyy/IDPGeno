@@ -59,7 +59,10 @@ model:
 training:
   device: auto
   num_folds: 5
-  num_epochs: 10
+  num_epochs: 50
+  split:
+    validation_fraction: 0.2
+  save_split_indices: false
   batch_size: 32
   num_workers: 0
 
@@ -81,7 +84,7 @@ training:
     min_lr: 1.0e-6
 
   early_stopping:
-    use: false
+    use: true
     monitor: auc
     mode: max
     patience: 10
@@ -93,9 +96,12 @@ training:
     dir: checkpoints/idpgeno_moe
 
 evaluation:
+  calibration: sigmoid
   threshold: 0.5
   metrics:
     - auc
+    - average_precision
+    - brier
     - acc
     - precision
     - recall

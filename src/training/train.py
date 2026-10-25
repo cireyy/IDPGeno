@@ -6,12 +6,98 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 import yaml
-from sklearn.model_selection import StratifiedKFold
+import json
+from pathlib import Path
 from torch.utils.data import DataLoader, Subset
 from src.data.dataset import IDPGenoProcessedDataset
 from src.models.idpgeno_model import IDPGenoModel
-from src.training.metrics import format_metrics
-from src.training.trainer import run_one_epoch, build_loss_fn, save_checkpoint
+from src.training.metrics import format_metrics, compute_binary_classification_metrics
+from src.training.trainer import run_one_epoch, build_loss_fn, save_checkpoint, predict_probabilities
+
+from dataclasses import dataclass
+from typing import Iterator
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.linear_model import LogisticRegression
+
+
+@dataclass(frozen=True)
+class FoldSplit:
+    fold: int
+    train: np.ndarray
+    validation: np.ndarray
+    test: np.ndarray
+
+
+def make_splits(labels, num_folds=5, validation_fraction=0.2, seed=42) -> Iterator[FoldSplit]:
+    labels = np.asarray(labels)
+    if labels.ndim != 1 or not np.isin(labels, [0, 1]).all():
+        raise ValueError("Labels must be a one-dimensional binary array.")
+    if not 0 < validation_fraction < 1:
+        raise ValueError("validation_fraction must be between 0 and 1.")
+    counts = np.bincount(labels.astype(int), minlength=2)
+    if num_folds < 2 or counts.min() < num_folds:
+        raise ValueError("Each class needs at least num_folds participants.")
+    outer = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+    for fold, (development, test) in enumerate(outer.split(np.zeros(len(labels)), labels), 1):
+        try:
+            train, validation = train_test_split(
+                development, test_size=validation_fraction,
+                stratify=labels[development], random_state=seed + fold,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Fold {fold}: insufficient cases/controls for the inner split.") from exc
+        for name, indices in (("training", train), ("validation", validation), ("test", test)):
+            if len(np.unique(labels[indices])) != 2:
+                raise ValueError(f"Fold {fold} {name} subset must contain both classes.")
+        yield FoldSplit(fold, train, validation, test)
+
+
+def class_distribution(labels, indices, fold, subset, positive_weight=None):
+    selected = np.asarray(labels)[indices].astype(int)
+    cases = int((selected == 1).sum())
+    controls = int((selected == 0).sum())
+    if cases == 0 or controls == 0:
+        raise ValueError("Both classes are required.")
+    return {
+        "fold": int(fold),
+        "subset": subset,
+        "n_participants": cases + controls,
+        "cases": cases,
+        "controls": controls,
+        "case_to_control_counts": f"{cases}:{controls}",
+        "controls_per_case": controls / cases,
+        "case_prevalence": cases / (cases + controls),
+        "positive_loss_weight": positive_weight if subset == "train" else None,
+        "resampled": False,
+    }
+
+
+def probability_logits(probabilities):
+    p = np.clip(np.asarray(probabilities, dtype=float), 1e-7, 1 - 1e-7)
+    return np.log(p / (1 - p)).reshape(-1, 1)
+
+
+def fit_sigmoid_calibration(labels, probabilities):
+    if len(np.unique(labels)) != 2:
+        raise ValueError("Calibration requires both classes in the validation subset.")
+    
+    model = LogisticRegression(C=1e6, solver="lbfgs", max_iter=1000)
+    model.fit(probability_logits(probabilities), labels)
+    return {
+        "method": "sigmoid",
+        "coefficient": float(model.coef_[0, 0]),
+        "intercept": float(model.intercept_[0]),
+        "fit_subset": "inner_validation",
+    }
+
+
+def apply_calibration(probabilities, state):
+    if state["method"] == "none":
+        return np.asarray(probabilities, dtype=float)
+    logits = probability_logits(probabilities).ravel()
+    z = np.clip(state["coefficient"] * logits + state["intercept"], -700, 700)
+    return 1 / (1 + np.exp(-z))
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +144,7 @@ def build_dataset(config: Dict[str, Any]) -> IDPGenoProcessedDataset:
         pos_col=data_cfg.get("pos_col", "relative_pos"),
         func_cols=data_cfg.get("func_cols", ["maf", "within_gene_weight_a"]),
         mask_col=data_cfg.get("mask_col", "is_valid"),
-        normalize_idp=data_cfg.get("normalize_idp", True),
+        normalize_idp=False,  
     )
     return dataset
 
@@ -103,130 +189,228 @@ def build_optimizer(model: IDPGenoModel, config: Dict[str, Any]) -> torch.optim.
     raise ValueError(f"Unsupported optimizer type: {opt_type}")
 
 
-def subset_labels(dataset: IDPGenoProcessedDataset, indices: np.ndarray) -> np.ndarray:
-    return dataset.labels[indices]
+
+def write_json(path, value):
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(value, stream, indent=2, allow_nan=False)
 
 
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
-
-    project_cfg = config["project"]
     train_cfg = config["training"]
-    ckpt_cfg = train_cfg["checkpoint"]
-    eval_cfg = config["evaluation"]
-
-    set_seed(project_cfg.get("seed", 42))
+    eval_cfg = config.get("evaluation", {})
+    seed = int(config["project"].get("seed", 42))
+    set_seed(seed)
+    if train_cfg.get("torch_num_threads"):
+        torch.set_num_threads(int(train_cfg["torch_num_threads"]))
     device = get_device(train_cfg.get("device", "auto"))
     print(f"Using device: {device}")
-    print(f"Config: {args.config}")
 
     dataset = build_dataset(config)
-    feature_info = dataset.get_feature_info()
+    info = dataset.get_feature_info()
     labels = dataset.labels.astype(int)
+    split_cfg = train_cfg.get("split", {})
+    validation_fraction = float(split_cfg.get("validation_fraction", 0.2))
+    splits = list(make_splits(labels, int(train_cfg["num_folds"]), validation_fraction, seed))
+    threshold = float(eval_cfg.get("threshold", 0.5))
+    if not 0 <= threshold <= 1:
+        raise ValueError("The classification threshold must be between 0 and 1.")
+    calibration_method = eval_cfg.get("calibration", "sigmoid")
+    if calibration_method not in ("none", "sigmoid"):
+        raise ValueError("evaluation.calibration must be 'none' or 'sigmoid'.")
+    use_weights = bool(train_cfg.get("loss", {}).get("use_pos_weight", True))
+    output = Path(config["project"]["output_dir"])
+    checkpoint_dir = Path(train_cfg["checkpoint"]["dir"])
+    output.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    num_folds = train_cfg["num_folds"]
-    num_epochs = train_cfg["num_epochs"]
-    batch_size = train_cfg["batch_size"]
-    num_workers = train_cfg.get("num_workers", 0)
-    save_dir = ckpt_cfg["dir"]
-    os.makedirs(save_dir, exist_ok=True)
+    write_json(output / "run_metadata.json", {
+        "evaluation_design": "outer_stratified_cv_with_inner_validation",
+        "validation_fraction_of_outer_development": validation_fraction,
+        "resampling": "none",
+        "positive_weight_source": "training_subset_only" if use_weights else "unweighted",
+        "normalisation_source": "training_subset_only",
+        "checkpoint_selection_source": "inner_validation_auc",
+        "calibration_source": "inner_validation" if calibration_method != "none" else "none",
+        "classification_threshold": threshold,
+        "num_participants": len(dataset),
+        "num_genes": info["num_genes"],
+        "num_idps": info["num_idps"],
+        "config": config,
+    })
 
-    skf = StratifiedKFold(
-        n_splits=num_folds,
-        shuffle=True,
-        random_state=project_cfg.get("seed", 42),
-    )
+    import pandas as pd
+    composition = []
+    fold_results = []
+    selected_models = []
+    oof_raw = np.full(len(labels), np.nan)
+    oof_calibrated = np.full(len(labels), np.nan)
 
-    fold_results: List[Dict[str, float]] = []
+    for split in splits:
+        fold_seed = seed + split.fold
+        set_seed(fold_seed)
+        if config["data"].get("normalize_idp", True):
+            dataset.fit_idp_normalisation(split.train)
 
-    for fold_idx, (train_idx, val_idx) in enumerate(
-        skf.split(np.zeros(len(labels)), labels), start=1
-    ):
-        print("\n" + "=" * 100)
-        print(f"Fold {fold_idx}/{num_folds}")
-        print("=" * 100)
+        loaders = {}
+        for name, indices in (("train", split.train), ("validation", split.validation), ("test", split.test)):
+            generator = torch.Generator().manual_seed(fold_seed)
+            loaders[name] = DataLoader(
+                Subset(dataset, indices.tolist()),
+                batch_size=int(train_cfg["batch_size"]),
+                shuffle=(name == "train"),
+                num_workers=int(train_cfg.get("num_workers", 0)),
+                generator=generator,
+            )
 
-        train_subset = Subset(dataset, train_idx.tolist())
-        val_subset = Subset(dataset, val_idx.tolist())
+        train_labels = labels[split.train]
+        criterion = build_loss_fn(train_labels, device, use_pos_weight=use_weights)
+        weight = float(criterion.pos_weight.item()) if criterion.pos_weight is not None else 1.0
+        for name, indices in (("train", split.train), ("validation", split.validation), ("test", split.test)):
+            composition.append(class_distribution(labels, indices, split.fold, name, weight))
+        pd.DataFrame(composition).to_csv(output / "fold_class_distribution.csv", index=False)
+        if train_cfg.get("save_split_indices", False):
+            np.savez_compressed(
+                output / f"fold_{split.fold}_indices.npz",
+                train=split.train, validation=split.validation, test=split.test,
+            )
 
-        train_loader = DataLoader(
-            train_subset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-        )
-        val_loader = DataLoader(
-            val_subset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-        )
-
-        model = build_model(feature_info, config).to(device)
-        criterion = build_loss_fn(subset_labels(dataset, train_idx), device=device)
-        optimizer = build_optimizer(model, config)
-
-        best_auc = -1.0
-        best_epoch = -1
-        best_metrics = None
+        model = build_model(info, config).to(device)
+        optimiser = build_optimizer(model, config)
+        scheduler_cfg = train_cfg.get("scheduler", {})
+        scheduler = None
+        if scheduler_cfg.get("use", False):
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimiser, mode="max",
+                factor=float(scheduler_cfg.get("factor", 0.5)),
+                patience=int(scheduler_cfg.get("patience", 3)),
+                min_lr=float(scheduler_cfg.get("min_lr", 1e-6)),
+            )
+        early_cfg = train_cfg.get("early_stopping", {})
+        best_auc = -float("inf")
+        best_epoch = None
         best_state = None
+        best_validation_metrics = None
+        stale_epochs = 0
+        history = []
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(1, int(train_cfg["num_epochs"]) + 1):
             train_loss, train_metrics = run_one_epoch(
-                model=model,
-                loader=train_loader,
-                criterion=criterion,
-                device=device,
-                optimizer=optimizer,
+                model, loaders["train"], criterion, device,
+                optimizer=optimiser, threshold=threshold,
             )
-
-            val_loss, val_metrics = run_one_epoch(
-                model=model,
-                loader=val_loader,
-                criterion=criterion,
-                device=device,
-                optimizer=None,
+            validation_loss, validation_metrics = run_one_epoch(
+                model, loaders["validation"], criterion, device,
+                threshold=threshold,
             )
-
+            validation_auc = validation_metrics["auc"]
+            row = {"epoch": epoch, "train_loss": train_loss, "validation_loss": validation_loss}
+            row.update({f"train_{key}": val for key, val in train_metrics.items()})
+            row.update({f"validation_{key}": val for key, val in validation_metrics.items()})
+            history.append(row)
             print(
-                f"[Fold {fold_idx}][Epoch {epoch:03d}] "
-                f"train_loss={train_loss:.4f} | {format_metrics(train_metrics)} || "
-                f"val_loss={val_loss:.4f} | {format_metrics(val_metrics)}"
+                f"[Fold {split.fold}][Epoch {epoch:03d}] "
+                f"train_loss={train_loss:.4f} validation_loss={validation_loss:.4f} "
+                f"validation {format_metrics(validation_metrics)}"
             )
-
-            val_auc = val_metrics.get("auc", float("nan"))
-            if not np.isnan(val_auc) and val_auc > best_auc:
-                best_auc = val_auc
+            if not np.isfinite(validation_auc):
+                raise ValueError("Validation AUROC is non-finite; check labels and predictions.")
+            if validation_auc > best_auc:
+                best_auc = validation_auc
                 best_epoch = epoch
-                best_metrics = copy.deepcopy(val_metrics)
-                best_state = copy.deepcopy(model.state_dict())
+                best_validation_metrics = copy.deepcopy(validation_metrics)
+                best_state = {key: val.detach().cpu().clone() for key, val in model.state_dict().items()}
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            if scheduler is not None:
+                scheduler.step(validation_auc)
+            if early_cfg.get("use", False) and stale_epochs >= int(early_cfg.get("patience", 10)):
+                break
 
-        if best_state is not None:
-            model.load_state_dict(best_state)
+        if best_state is None:
+            raise ValueError("No valid checkpoint was selected; num_epochs must be positive.")
+        model.load_state_dict(best_state)
+        pd.DataFrame(history).to_csv(output / f"fold_{split.fold}_training_history.csv", index=False)
 
-        ckpt_path = os.path.join(save_dir, f"fold_{fold_idx}_best.pt")
+        
+        calibration_state = {"method": "none", "fit_subset": None}
+        if calibration_method == "sigmoid":
+            validation_labels, validation_probabilities = predict_probabilities(
+                model, loaders["validation"], device,
+            )
+            calibration_state = fit_sigmoid_calibration(validation_labels, validation_probabilities)
+
+        statistics = dataset.get_idp_stats()
+        normalisation = None if statistics is None else {
+            "mean": statistics[0].tolist(), "std": statistics[1].tolist(),
+            "fit_subset": "train",
+        }
+        checkpoint = checkpoint_dir / f"fold_{split.fold}_best.pt"
         save_checkpoint(
-            model=model,
-            path=ckpt_path,
-            epoch=best_epoch,
-            metrics=best_metrics if best_metrics is not None else {},
+            model, str(checkpoint), best_epoch, best_validation_metrics,
+            extra={
+                "metric_subset": "inner_validation",
+                "normalisation": normalisation,
+                "calibration": calibration_state,
+                "gene_ids": info["gene_ids"],
+                "idp_columns": info["idp_cols"],
+                "feature_info": info,
+                "config": config,
+                "positive_loss_weight": weight,
+                "classification_threshold": threshold,
+            },
         )
 
-        print(f"\nBest fold {fold_idx} epoch: {best_epoch}")
-        if best_metrics is not None:
-            print(f"Best fold {fold_idx} metrics: {format_metrics(best_metrics)}")
-            fold_results.append(best_metrics)
+        
+        test_labels, raw_probabilities = predict_probabilities(model, loaders["test"], device)
+        calibrated_probabilities = apply_calibration(raw_probabilities, calibration_state)
+        raw_metrics = compute_binary_classification_metrics(test_labels, raw_probabilities, threshold)
+        calibrated_metrics = compute_binary_classification_metrics(
+            test_labels, calibrated_probabilities, threshold,
+        )
+        test_row = {"fold": split.fold}
+        test_row.update({f"raw_{key}": val for key, val in raw_metrics.items()})
+        test_row.update({f"calibrated_{key}": val for key, val in calibrated_metrics.items()})
+        fold_results.append(test_row)
+        oof_raw[split.test] = raw_probabilities
+        oof_calibrated[split.test] = calibrated_probabilities
+        selected_models.append({
+            "fold": split.fold, "selected_epoch": best_epoch,
+            "validation_auc": best_auc, "positive_loss_weight": weight,
+            "checkpoint": str(checkpoint), "calibration": calibration_state,
+        })
+        pd.DataFrame(fold_results).to_csv(output / "fold_test_metrics.csv", index=False)
+        write_json(output / "selected_models.json", selected_models)
+        print(f"[Fold {split.fold}] final test (raw): {format_metrics(raw_metrics)}")
+        if calibration_method != "none":
+            print(f"[Fold {split.fold}] final test (calibrated): {format_metrics(calibrated_metrics)}")
 
-    print("\n" + "=" * 100)
-    print("Cross-validation summary")
-    print("=" * 100)
-
-    if len(fold_results) > 0:
-        metric_names = eval_cfg.get("metrics", ["auc", "acc", "precision", "recall", "f1"])
-        for metric_name in metric_names:
-            values = np.array([fr[metric_name] for fr in fold_results], dtype=float)
-            print(f"{metric_name}: {np.nanmean(values):.4f} ± {np.nanstd(values):.4f}")
+    if not np.isfinite(oof_raw).all() or not np.isfinite(oof_calibrated).all():
+        raise RuntimeError("Every participant must receive exactly one outer-test prediction.")
+    result_frame = pd.DataFrame(fold_results)
+    summaries = {}
+    for column in result_frame.columns:
+        if column != "fold":
+            values = result_frame[column].to_numpy(dtype=float)
+            summaries[column] = {
+                "mean": float(np.mean(values)),
+                "sd_across_folds": float(np.std(values, ddof=1)),
+            }
+    write_json(output / "cross_validation_summary.json", {
+        "fold_metrics": summaries,
+        "pooled_out_of_fold_raw": compute_binary_classification_metrics(labels, oof_raw, threshold),
+        "pooled_out_of_fold_calibrated": compute_binary_classification_metrics(labels, oof_calibrated, threshold),
+        "calibration_method": calibration_method,
+        "classification_threshold": threshold,
+    })
+    if config.get("logging", {}).get("save_fold_predictions", False):
+        pd.DataFrame({
+            "participant_id": dataset.participant_ids, "label": labels,
+            "raw_probability": oof_raw, "calibrated_probability": oof_calibrated,
+        }).to_csv(output / "out_of_fold_predictions.csv", index=False)
+    print(f"Saved class distributions, training histories and final test metrics to {output}")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ class IDPGenoProcessedDataset(Dataset):
         pos_col: str = "relative_pos",
         func_cols: Optional[List[str]] = None,
         mask_col: str = "is_valid",
-        normalize_idp: bool = True,
+        normalize_idp: bool = False,
         idp_mean: Optional[np.ndarray] = None,
         idp_std: Optional[np.ndarray] = None,
     ) -> None:
@@ -40,11 +40,16 @@ class IDPGenoProcessedDataset(Dataset):
         self.func_cols = func_cols
 
         # Load tables
-        self.samples_df = pd.read_csv(samples_csv)
-        self.tokens_df = pd.read_csv(snp_tokens_csv)
+        self.samples_df = pd.read_csv(samples_csv, dtype={participant_col: str})
+        self.tokens_df = pd.read_csv(snp_tokens_csv, dtype={participant_col: str, gene_col: str})
 
         # Basic checks
         self._check_required_columns()
+        if self.samples_df[self.participant_col].isna().any() or self.samples_df[self.participant_col].duplicated().any():
+            raise ValueError("The sample table must contain one non-missing row per participant.")
+        raw_labels = self.samples_df[self.label_col].to_numpy()
+        if not np.isin(raw_labels, [0, 1]).all():
+            raise ValueError("Outcome labels must be 0 (control) or 1 (case).")
 
         # Detect IDP columns from sample table
         self.idp_cols = self._detect_idp_columns()
@@ -59,21 +64,17 @@ class IDPGenoProcessedDataset(Dataset):
         # IDP matrix
         self.idp_array = self.samples_df[self.idp_cols].to_numpy(dtype=np.float32)
 
-        # Normalize IDPs
+        
+        if not np.isfinite(self.idp_array).all():
+            raise ValueError("IDPs must be finite; fit any imputation on training data only.")
+        self.raw_idp_array = self.idp_array.copy()
         self.normalize_idp = normalize_idp
-        if self.normalize_idp:
+        self.idp_mean = None
+        self.idp_std = None
+        if normalize_idp:
             if idp_mean is None or idp_std is None:
-                self.idp_mean = self.idp_array.mean(axis=0)
-                self.idp_std = self.idp_array.std(axis=0)
-            else:
-                self.idp_mean = idp_mean.astype(np.float32)
-                self.idp_std = idp_std.astype(np.float32)
-
-            self.idp_std = np.where(self.idp_std < 1e-8, 1.0, self.idp_std)
-            self.idp_array = (self.idp_array - self.idp_mean) / self.idp_std
-        else:
-            self.idp_mean = None
-            self.idp_std = None
+                raise ValueError("Supply training-only IDP statistics, or use fit_idp_normalisation().")
+            self.apply_idp_normalisation(idp_mean, idp_std)
 
         # Build gene order
         self.gene_ids = sorted(self.tokens_df[self.gene_col].astype(str).unique().tolist())
@@ -197,6 +198,26 @@ class IDPGenoProcessedDataset(Dataset):
             "snp_mask": torch.tensor(self.snp_mask[idx], dtype=torch.float32),
             "label": torch.tensor(self.labels[idx], dtype=torch.float32),
         }
+
+    def apply_idp_normalisation(self, mean: np.ndarray, std: np.ndarray) -> None:
+        mean = np.asarray(mean, dtype=np.float32)
+        std = np.asarray(std, dtype=np.float32)
+        expected = (len(self.idp_cols),)
+        if mean.shape != expected or std.shape != expected:
+            raise ValueError("IDP statistics have an incompatible shape.")
+        if not np.isfinite(mean).all() or not np.isfinite(std).all() or (std < 0).any():
+            raise ValueError("IDP statistics must be finite, with non-negative standard deviations.")
+        self.idp_mean = mean.copy()
+        self.idp_std = np.where(std < 1e-8, 1.0, std).astype(np.float32)
+        self.idp_array = (self.raw_idp_array - self.idp_mean) / self.idp_std
+        self.normalize_idp = True
+
+    def fit_idp_normalisation(self, train_indices: np.ndarray) -> None:
+        indices = np.asarray(train_indices, dtype=int)
+        if indices.size == 0:
+            raise ValueError("Cannot fit normalisation on an empty training subset.")
+        train_values = self.raw_idp_array[indices]
+        self.apply_idp_normalisation(train_values.mean(axis=0), train_values.std(axis=0))
 
     def get_idp_stats(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         if self.idp_mean is None or self.idp_std is None:

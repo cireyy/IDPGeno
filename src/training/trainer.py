@@ -18,6 +18,7 @@ def run_one_epoch(
     criterion: nn.Module,
     device: torch.device,
     optimizer: torch.optim.Optimizer = None,
+    threshold: float = 0.5,
 ) -> Tuple[float, Dict[str, float]]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -67,23 +68,39 @@ def run_one_epoch(
     y_true = np.concatenate(all_labels, axis=0)
     y_prob = np.concatenate(all_probs, axis=0)
 
-    metrics = compute_binary_classification_metrics(y_true=y_true, y_prob=y_prob)
+    metrics = compute_binary_classification_metrics(y_true=y_true, y_prob=y_prob, threshold=threshold)
 
     return mean_loss, metrics
 
 
-def build_loss_fn(train_labels: np.ndarray, device: torch.device) -> nn.Module:
-    train_labels = np.asarray(train_labels).astype(int)
+def build_loss_fn(train_labels: np.ndarray, device: torch.device, use_pos_weight: bool = True) -> nn.Module:
+    train_labels = np.asarray(train_labels)
+    if not np.isin(train_labels, [0, 1]).all():
+        raise ValueError("Loss weights require binary training labels.")
     num_pos = int((train_labels == 1).sum())
     num_neg = int((train_labels == 0).sum())
+    if num_pos == 0 or num_neg == 0:
+        raise ValueError("The training subset must contain both cases and controls.")
+    if not use_pos_weight:
+        return nn.BCEWithLogitsLoss()
+    positive_weight = torch.tensor([num_neg / num_pos], dtype=torch.float32, device=device)
+    return nn.BCEWithLogitsLoss(pos_weight=positive_weight)
 
-    if num_pos == 0:
-        pos_weight = 1.0
-    else:
-        pos_weight = num_neg / max(num_pos, 1)
 
-    pos_weight_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
-    return nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+def predict_probabilities(model, loader, device):
+    model.eval()
+    labels, probabilities = [], []
+    with torch.no_grad():
+        for batch in loader:
+            batch = move_batch_to_device(batch, device)
+            outputs = model(
+                idp=batch["idp"], geno_ids=batch["geno_ids"],
+                pos_values=batch["pos_values"], func_values=batch["func_values"],
+                snp_mask=batch["snp_mask"],
+            )
+            labels.append(batch["label"].cpu().numpy())
+            probabilities.append(torch.sigmoid(outputs["logits"]).cpu().numpy())
+    return np.concatenate(labels).astype(int), np.concatenate(probabilities)
 
 
 def save_checkpoint(
@@ -91,6 +108,7 @@ def save_checkpoint(
     path: str,
     epoch: int,
     metrics: Dict[str, float],
+    extra: dict = None,
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
@@ -98,6 +116,7 @@ def save_checkpoint(
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "metrics": metrics,
+            **(extra or {}),
         },
         path,
     )
